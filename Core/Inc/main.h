@@ -57,6 +57,18 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define MCO_Pin GPIO_PIN_0
+#define MCO_GPIO_Port GPIOA
+#define VCP_TX_Pin GPIO_PIN_2
+#define VCP_TX_GPIO_Port GPIOA
+#define Pot_Monitor_Pin GPIO_PIN_3
+#define Pot_Monitor_GPIO_Port GPIOA
+#define Battery_Monitor_Pin GPIO_PIN_0
+#define Battery_Monitor_GPIO_Port GPIOB
+#define PWM_Fan_Control_Pin GPIO_PIN_10
+#define PWM_Fan_Control_GPIO_Port GPIOA
+#define PWM_Tach_Monitor_Pin GPIO_PIN_11
+#define PWM_Tach_Monitor_GPIO_Port GPIOA
 #define SWDIO_Pin GPIO_PIN_13
 #define SWDIO_GPIO_Port GPIOA
 #define SWCLK_Pin GPIO_PIN_14
@@ -65,9 +77,10 @@ void Error_Handler(void);
 #define VCP_RX_GPIO_Port GPIOA
 #define LD3_Pin GPIO_PIN_3
 #define LD3_GPIO_Port GPIOB
-#define FanTachometer_Pin GPIO_PIN_5
-#define FanTachometer_GPIO_Port GPIOB
-#define FanTachometer_EXTI_IRQn EXTI9_5_IRQn
+#define LCD_I2C_Clock_Pin GPIO_PIN_6
+#define LCD_I2C_Clock_GPIO_Port GPIOB
+#define LCD_I2C_Data_Pin GPIO_PIN_7
+#define LCD_I2C_Data_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

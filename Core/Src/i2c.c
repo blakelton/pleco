@@ -21,6 +21,8 @@
 #include "i2c.h"
 
 /* USER CODE BEGIN 0 */
+LiquidCrystal_I2C lcd;
+
 
 /* USER CODE END 0 */
 
@@ -38,7 +40,7 @@ void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x00B07CB4;
+  hi2c1.Init.Timing = 0x10B17DB5;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -65,6 +67,12 @@ void MX_I2C1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN I2C1_Init 2 */
+
+  // Initialize the LCD
+  lcd_init(&lcd, &hi2c1, 0x27, 16, 2); // Adjust I2C address if necessary
+  lcd_clear(&lcd);
+  lcd_setCursor(&lcd, 0, 0);
+  lcd_print(&lcd, "System Init");
 
   /* USER CODE END I2C1_Init 2 */
 
@@ -95,7 +103,7 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
     PB6     ------> I2C1_SCL
     PB7     ------> I2C1_SDA
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7;
+    GPIO_InitStruct.Pin = LCD_I2C_Clock_Pin|LCD_I2C_Data_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
@@ -125,9 +133,9 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* i2cHandle)
     PB6     ------> I2C1_SCL
     PB7     ------> I2C1_SDA
     */
-    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_6);
+    HAL_GPIO_DeInit(LCD_I2C_Clock_GPIO_Port, LCD_I2C_Clock_Pin);
 
-    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_7);
+    HAL_GPIO_DeInit(LCD_I2C_Data_GPIO_Port, LCD_I2C_Data_Pin);
 
   /* USER CODE BEGIN I2C1_MspDeInit 1 */
 
