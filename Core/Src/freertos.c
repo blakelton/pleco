@@ -57,10 +57,10 @@ uint16_t potReadValue;
 uint16_t batteryReadValue;
 uint16_t tachReadValue;
 extern LiquidCrystal_I2C lcd;
+uint32_t localFanPeriod = 0;
 
 
 /* USER CODE END Variables */
-
 /* Definitions for FanControlTask */
 osThreadId_t FanControlTaskHandle;
 const osThreadAttr_t FanControlTask_attributes = {
@@ -99,6 +99,11 @@ osSemaphoreId_t adcConvSemHandle;
 const osSemaphoreAttr_t adcConvSem_attributes = {
   .name = "adcConvSem"
 };
+/* Definitions for tachMonSem */
+osSemaphoreId_t tachMonSemHandle;
+const osSemaphoreAttr_t tachMonSem_attributes = {
+  .name = "tachMonSem"
+};
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -132,6 +137,9 @@ void MX_FREERTOS_Init(void) {
   /* Create the semaphores(s) */
   /* creation of adcConvSem */
   adcConvSemHandle = osSemaphoreNew(1, 1, &adcConvSem_attributes);
+
+  /* creation of tachMonSem */
+  tachMonSemHandle = osSemaphoreNew(1, 1, &tachMonSem_attributes);
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
@@ -177,11 +185,8 @@ void MX_FREERTOS_Init(void) {
 /* USER CODE END Header_StartFanControlTask */
 void StartFanControlTask(void *argument)
 {
-	/* USER CODE BEGIN StartFanControlTask */
+  /* USER CODE BEGIN StartFanControlTask */
 	const uint32_t pwmMaxValue = __HAL_TIM_GET_AUTORELOAD(&htim1); // Max value for the PWM duty cycle (timer auto-reload value)
-
-	// Start the PWM output on the desired channel (ensure this is done once)
-	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
 
 	for(;;)
 	{
@@ -198,8 +203,7 @@ void StartFanControlTask(void *argument)
 
 		osDelay(100); // Adjust as necessary
 	}
-	/* USER CODE END StartFanControlTask */
-
+  /* USER CODE END StartFanControlTask */
 }
 
 /* USER CODE BEGIN Header_StartMonitorADCTask */
@@ -267,13 +271,62 @@ void StartMonitorADCTask(void *argument)
 void StartMonitorTachTask(void *argument)
 {
   /* USER CODE BEGIN StartMonitorTachTask */
-  /* Infinite loop */
-  for(;;)
-  {
+	// Timer frequency in Hz (1Mhz with 63 prescaler)
+	const float timerFreq = 1000000.0f;
+	float localFrequency = 0.0f;
+	const float pulsesPerRev = 4.0f;
+	uint16_t rpm = 0;
+	/* Infinite loop */
+	for(;;)
+	{
+		// Get the current time and the last update time first
+		TickType_t currentTime = xTaskGetTickCount();
+
+		// Check how long since the last pulse
+		TickType_t timeSinceLastPulse = currentTime - lastTachUpdateTime;
+
+		// If more than 1000ms have passed without a new pulse, fan is effectively stopped
+		if (timeSinceLastPulse > pdMS_TO_TICKS(1000))
+		{
+			rpm = 0;
+			// Update shared variable for RPM
+			if(osMutexAcquire(dataMutexHandle, osWaitForever) == osOK)
+			{
+				tachReadValue = rpm;
+				osMutexRelease(dataMutexHandle);
+			}
+		}
+		else
+		{
+			// Check semaphore if read task is available from tach callback
+			if(xSemaphoreTake(tachMonSemHandle, pdMS_TO_TICKS(100)) == pdTRUE)
+			{
+				// Capture event has occurred - compute new RPM reading
+				localFanPeriod = fanPeriodTicks;
+				if(localFanPeriod > 0)
+				{
+					// Calculate RPM
+					localFrequency = timerFreq / (float)localFanPeriod;
+					rpm = (uint16_t)(localFrequency * ((float)60 / pulsesPerRev));
+				}
+				else
+				{
+					// If not data - RPM is likely zero
+					rpm = 0;
+				}
+
+				//Store the RPM as a shared variable
+				if(osMutexAcquire(dataMutexHandle, osWaitForever) == osOK)
+				{
+					tachReadValue = rpm;
+					osMutexRelease(dataMutexHandle);
+				}
+			}
+		}
 
 
-    osDelay(1);
-  }
+	osDelay(pdMS_TO_TICKS(100));
+	}
   /* USER CODE END StartMonitorTachTask */
 }
 
@@ -309,17 +362,17 @@ void StartUpdateLCDTask(void *argument)
 	currentBatteryVoltage = (float)((int)(currentBatteryVoltage * 10)) / 10.0f; // trim to tenth place
 
 	// Update LCD with new data
-	snprintf(line1, sizeof(line1), "RPM: %5u/%5u", currentFanRPM, targetFanRPM);
+	snprintf(line1, sizeof(line1), "RPM: %5u/ %3u%%", currentFanRPM, targetFanRPM);
 	lcd_setCursor(&lcd, 0, 0);
 	lcd_print(&lcd, line1);
-	snprintf(line2, sizeof(line2), "Power: %.1f/%u%%", currentBatteryVoltage, batteryLifeRemaining);
+	snprintf(line2, sizeof(line2), "Power: %.1fv/%2u%%", currentBatteryVoltage, batteryLifeRemaining);
 
 	lcd_setCursor(&lcd, 0, 1);
 	lcd_print(&lcd, line2);
 
 	osDelay(100); // Adjust as needed
   }
-/* USER CODE END StartTaskLCDUpdateTask */
+  /* USER CODE END StartUpdateLCDTask */
 }
 
 /* Private application code --------------------------------------------------*/

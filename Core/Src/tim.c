@@ -22,6 +22,14 @@
 
 /* USER CODE BEGIN 0 */
 
+#define CAPTURE_LOG_SIZE 1000
+volatile uint32_t lastCapture = 0; //store the last captured timer value
+volatile uint32_t fanPeriodTicks = 0; //store the computed period in timer ticks
+volatile unsigned int captureLogIndex = 0;
+volatile uint8_t captureLogOverflow = 0;        // Flag to indicate buffer overflow
+volatile uint32_t captureLog[CAPTURE_LOG_SIZE];
+volatile TickType_t lastTachUpdateTime = 0; //store the tick count of the last pulse
+extern SemaphoreHandle_t tachMonSemHandle; // Declared in freertos.c
 /* USER CODE END 0 */
 
 TIM_HandleTypeDef htim1;
@@ -44,7 +52,7 @@ void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 0;
+  htim1.Init.Prescaler = 63;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim1.Init.Period = 65535;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -138,6 +146,9 @@ void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* tim_baseHandle)
     GPIO_InitStruct.Alternate = GPIO_AF1_TIM1;
     HAL_GPIO_Init(PWM_Tach_Monitor_GPIO_Port, &GPIO_InitStruct);
 
+    /* TIM1 interrupt Init */
+    HAL_NVIC_SetPriority(TIM1_CC_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(TIM1_CC_IRQn);
   /* USER CODE BEGIN TIM1_MspInit 1 */
 
   /* USER CODE END TIM1_MspInit 1 */
@@ -188,6 +199,8 @@ void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* tim_baseHandle)
     */
     HAL_GPIO_DeInit(GPIOA, PWM_Fan_Control_Pin|PWM_Tach_Monitor_Pin);
 
+    /* TIM1 interrupt Deinit */
+    HAL_NVIC_DisableIRQ(TIM1_CC_IRQn);
   /* USER CODE BEGIN TIM1_MspDeInit 1 */
 
   /* USER CODE END TIM1_MspDeInit 1 */
@@ -195,5 +208,55 @@ void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* tim_baseHandle)
 }
 
 /* USER CODE BEGIN 1 */
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+	if(htim->Instance == TIM1 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_4)
+	{
+		uint32_t currentCapture = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_4);
+
+		// Include the overflows in the period calculation
+		// period = (overflows * (Period+1)) + normal difference
+		uint32_t baseTicks = (htim1.Init.Period + 1);
+
+		uint32_t period;
+		if (currentCapture >= lastCapture)
+		{
+			// No wrap between captures
+			period = (overflowCount * baseTicks) + (currentCapture - lastCapture);
+		}
+		else
+		{
+			// There was at least one wrap
+			period = (overflowCount * baseTicks) + ((baseTicks - lastCapture) + currentCapture);
+		}
+
+		// Reset overflowCount since we've accounted for it
+		overflowCount = 0;
+
+		 // Log the current capture value for analyzing tach data
+		captureLog[captureLogIndex] = period;  // Write to the buffer
+		captureLogIndex++;                            // Increment the index
+
+		if (captureLogIndex >= CAPTURE_LOG_SIZE)      // Handle buffer overflow
+		{
+			captureLogIndex = 0;                      // Reset index (circular buffer)
+			captureLogOverflow = 1;                   // Indicate overflow
+		}
+		// Update last capture value
+		lastCapture = currentCapture;
+
+		// Update the global period variable - used in the task to compute RPM
+		fanPeriodTicks = period;
+
+		// Record the current time of this event using ISR-Safe function
+		lastTachUpdateTime = xTaskGetTickCountFromISR();
+
+		// Set semaphore to let freertos read task commence
+		BaseType_t xHigherTaskPriorityTaskWoken = pdFALSE;
+		xSemaphoreGiveFromISR(tachMonSemHandle, &xHigherTaskPriorityTaskWoken);
+		portYIELD_FROM_ISR(xHigherTaskPriorityTaskWoken);
+	}
+}
 
 /* USER CODE END 1 */

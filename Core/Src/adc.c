@@ -21,11 +21,6 @@
 #include "adc.h"
 
 /* USER CODE BEGIN 0 */
-#include "cmsis_os.h"
-#include "freertos.h"
-#include "FreeRTOS.h"
-#include "semphr.h"
-
 
 extern SemaphoreHandle_t adcConvSemHandle; // Declared in freertos.c
 /* USER CODE END 0 */

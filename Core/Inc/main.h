@@ -36,6 +36,7 @@ extern "C" {
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
+extern volatile uint32_t overflowCount;
 
 /* USER CODE END ET */
 

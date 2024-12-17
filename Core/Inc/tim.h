@@ -29,6 +29,13 @@ extern "C" {
 #include "main.h"
 
 /* USER CODE BEGIN Includes */
+#include "cmsis_os.h"
+#include "FreeRTOS.h"
+#include "semphr.h"
+
+extern volatile uint32_t lastCapture;
+extern volatile uint32_t fanPeriodTicks;
+extern volatile TickType_t lastTachUpdateTime;
 
 /* USER CODE END Includes */
 

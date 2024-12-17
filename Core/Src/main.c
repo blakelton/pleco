@@ -49,6 +49,7 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+volatile uint32_t overflowCount = 0;
 
 /* USER CODE END PV */
 
@@ -89,6 +90,7 @@ int main(void)
 
   /* USER CODE BEGIN SysInit */
 
+
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -99,6 +101,11 @@ int main(void)
   MX_I2C1_Init();
   MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
+
+  // Start the PWM output on for fan control
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  // Initialize Timer 1 for tachometer Feedback
+  HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_4);
 
   /* USER CODE END 2 */
 
@@ -188,6 +195,11 @@ void SystemClock_Config(void)
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   /* USER CODE BEGIN Callback 0 */
+  if (htim->Instance == TIM1)
+  {
+	// Increment overflow counter
+  	overflowCount++;
+  }
 
   /* USER CODE END Callback 0 */
   if (htim->Instance == TIM2) {

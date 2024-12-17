@@ -69,7 +69,7 @@ void MX_I2C1_Init(void)
   /* USER CODE BEGIN I2C1_Init 2 */
 
   // Initialize the LCD
-  lcd_init(&lcd, &hi2c1, 0x27, 16, 2); // Adjust I2C address if necessary
+  lcd_init(&lcd, &hi2c1, 0x27, 16, 2);
   lcd_clear(&lcd);
   lcd_setCursor(&lcd, 0, 0);
   lcd_print(&lcd, "System Init");
