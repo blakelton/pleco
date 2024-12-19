@@ -3,6 +3,8 @@ Pleco is a small handvac that I decided to make for fun!
 
 This repository contains the firmware, configuration details, and 3D models for a hand vacuum system based on the STM32L432KC MCU. The device is designed to manage a 12V PWM-controlled cooling fan for suction, display operating parameters on an LCD, handle user input for speed control, and monitor battery voltage. Additionally, 3D-printable models for the vacuum enclosure and components are included.
 
+![Pleco Left Side](https://github.com/blakelton/pleco/blob/develop/Images/LSide.jpg?raw=true)
+
 ## Overview
 
 The hand vacuum system includes:
@@ -51,6 +53,10 @@ The hand vacuum system includes:
 
 7. **3D Models:**
    - The `Models` folder contains 3D models (STL or other formats) that can be used to 3D print the vacuum enclosure and related mechanical parts. Ensure proper print settings and material selection as per instructions or personal preference.
+
+8. **Wiring Schematics**
+   - The `Wiring` folder contains a rough wiring schmatic on how this system was put together. This folder 
+   also includes a pinout for the MCU board. Both of these files are in pdf format.
 
 ## Software and Firmware
 
