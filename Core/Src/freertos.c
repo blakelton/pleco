@@ -274,7 +274,7 @@ void StartMonitorTachTask(void *argument)
 	// Timer frequency in Hz (1Mhz with 63 prescaler)
 	const float timerFreq = 1000000.0f;
 	float localFrequency = 0.0f;
-	const float pulsesPerRev = 4.0f;
+	const float pulsesPerRev = 2.0f;
 	uint16_t rpm = 0;
 	/* Infinite loop */
 	for(;;)
