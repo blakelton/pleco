@@ -58,7 +58,8 @@ uint16_t batteryReadValue;
 uint16_t tachReadValue;
 extern LiquidCrystal_I2C lcd;
 uint32_t localFanPeriod = 0;
-
+// Max RPM - for DBTB0428B2G - manually measured using external tach;
+float maxRPM = 22000.0f;
 
 /* USER CODE END Variables */
 /* Definitions for FanControlTask */
@@ -188,20 +189,60 @@ void StartFanControlTask(void *argument)
   /* USER CODE BEGIN StartFanControlTask */
 	const uint32_t pwmMaxValue = __HAL_TIM_GET_AUTORELOAD(&htim1); // Max value for the PWM duty cycle (timer auto-reload value)
 
+	// PID variables
+	float pidIntegral = 0.0f;
+	float previousError = 0.0f;
+	float kP = 62.0f;
+	float kI = 1.62f;
+	float kD = 0.162f;
+	float dT = 0.01f; // Assumes this tasks runs every 100ms
+	float setPoint = 0.0f;
+	float error = 0.0f;
+	float pidDerivative = 0.0f;
+	float pidOutput = 0.0f;
+	float scaledDuty = 0.0f;
+	uint16_t potValue = 0; // Get the latest potentiometer value (0-100%)
+	uint16_t currentRPM = 0;
+
+
+
+
 	for(;;)
 	{
 		// Acquire the mutex to safely access potReadValue
 		osMutexAcquire(dataMutexHandle, osWaitForever);
-		uint16_t potValue = potReadValue; // Get the latest potentiometer value (0-100%)
+		potValue = potReadValue; // Get the latest potentiometer value (0-100%)
+		currentRPM = tachReadValue;
 		osMutexRelease(dataMutexHandle);
 
-		// Convert the percentage to a duty cycle value
-		uint32_t dutyCycle = (uint32_t)((potValue / 100.0f) * pwmMaxValue);
+		// Convert the potValue to a target RPM
+		setPoint = (potValue / 100.0f) * maxRPM;
 
-		// Set the PWM duty cycle
-		__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, dutyCycle);
+		// Calculate PID Error
+		error = setPoint - currentRPM;
 
-		osDelay(100); // Adjust as necessary
+		// PID Calculation
+		pidIntegral += error * dT;
+		pidDerivative = (error - previousError) / dT;
+		//pidOutput = (kP * error);
+		//pidOutput = (kP * error) + (kI * pidIntegral);
+		pidOutput = (kP * error) + (kI * pidIntegral) + (kD * pidDerivative);
+
+		scaledDuty = (pidOutput / maxRPM) * (float)pwmMaxValue;
+
+		// Clamp to [0, pwmMaxValue]
+		if (scaledDuty < 0)
+		{
+			scaledDuty = 0;
+		}
+		if (scaledDuty > (float)pwmMaxValue) scaledDuty = (float)pwmMaxValue;
+
+		previousError = error;
+
+		//Set PWM based on PID Output
+		__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)scaledDuty);
+
+		osDelay(pdMS_TO_TICKS(10)); // Adjust as necessary
 	}
   /* USER CODE END StartFanControlTask */
 }
@@ -353,7 +394,9 @@ void StartUpdateLCDTask(void *argument)
 	osMutexAcquire(dataMutexHandle, osWaitForever);
 	currentFanRPM = tachReadValue;
 	currentBatteryVoltage = batteryReadValue;
-	targetFanRPM = potReadValue;
+	//targetFanRPM = potReadValue;
+	// Convert the potValue to a target RPM
+	targetFanRPM = (potReadValue / 100.0f) * maxRPM;
 	osMutexRelease(dataMutexHandle);
 
 	// Calculate battery life - based on 12v 3s lipo battery
@@ -362,7 +405,7 @@ void StartUpdateLCDTask(void *argument)
 	currentBatteryVoltage = (float)((int)(currentBatteryVoltage * 10)) / 10.0f; // trim to tenth place
 
 	// Update LCD with new data
-	snprintf(line1, sizeof(line1), "RPM: %5u/ %3u%%", currentFanRPM, targetFanRPM);
+	snprintf(line1, sizeof(line1), "RPM: %5u/%5u", currentFanRPM, targetFanRPM);
 	lcd_setCursor(&lcd, 0, 0);
 	lcd_print(&lcd, line1);
 	snprintf(line2, sizeof(line2), "Power: %.1fv/%2u%%", currentBatteryVoltage, batteryLifeRemaining);

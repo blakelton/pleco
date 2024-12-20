@@ -39,7 +39,7 @@ extern "C" {
 extern ADC_HandleTypeDef hadc1;
 
 /* USER CODE BEGIN Private defines */
-#define BATTERY_SCALING_FACTOR 7.38f
+#define BATTERY_SCALING_FACTOR 7.18f
 
 /* USER CODE END Private defines */
 

@@ -96,7 +96,7 @@ void MX_TIM1_Init(void)
   sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_FALLING;
   sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
   sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 0;
+  sConfigIC.ICFilter = 15;
   if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_4) != HAL_OK)
   {
     Error_Handler();
