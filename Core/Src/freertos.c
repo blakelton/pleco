@@ -31,6 +31,7 @@
 #include "liquidcrystal_i2c.h"
 #include "tim.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 
 /* USER CODE END Includes */
@@ -58,29 +59,41 @@ uint16_t batteryReadValue;
 uint16_t tachReadValue;
 extern LiquidCrystal_I2C lcd;
 uint32_t localFanPeriod = 0;
+
 // Max RPM - for DBTB0428B2G - manually measured using external tach;
 float maxRPM = 22000.0f;
+
+// used for PID Tuning
+float percentOnTarget = 0.0f;
+volatile float kP = 0.0f;
+volatile float kI = 0.0f;
+volatile float kD = 0.0f;
+float bestScore = -1.0f;
+float score = 0.0f;
+float testSetpoint = 0.7f; // 70% or 15400 RPM for PID tuning
+float testTime = 5.0f; // 15 seconds each test
+
 
 /* USER CODE END Variables */
 /* Definitions for FanControlTask */
 osThreadId_t FanControlTaskHandle;
 const osThreadAttr_t FanControlTask_attributes = {
   .name = "FanControlTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
 };
 /* Definitions for MonitorADCTask */
 osThreadId_t MonitorADCTaskHandle;
 const osThreadAttr_t MonitorADCTask_attributes = {
   .name = "MonitorADCTask",
   .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityBelowNormal,
+  .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for MonitorTachTask */
 osThreadId_t MonitorTachTaskHandle;
 const osThreadAttr_t MonitorTachTask_attributes = {
   .name = "MonitorTachTask",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
 };
 /* Definitions for UpdateLCDTask */
@@ -108,6 +121,169 @@ const osSemaphoreAttr_t tachMonSem_attributes = {
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
+
+void SetPIDGains(float kp, float ki, float kd)
+{
+    kP = kp;
+    kI = ki;
+    kD = kd;
+}
+
+/**
+  * @brief  Runs a mini PID loop at the specified (testKp, testKi, testKd)
+  *         for the specified duration. It drives the fan (PWM) using
+  *         scaledDuty calls, measures performance, then returns a "score"
+  *         (e.g., fraction of time on target).
+  *
+  * @param  testKp, testKi, testKd : Gains to apply temporarily
+  * @param  testTimeSeconds        : How long (in seconds) to run the test
+  * @param  setPointRPM            : Desired target RPM for the test
+  * @return float                  : The measured performance score
+  */
+float RunPIDTest(float testKp, float testKi, float testKd)
+{
+    /* 1) Save original gains so we can restore later. */
+    float originalKp = kP;
+    float originalKi = kI;
+    float originalKd = kD;
+
+    /* 2) Apply the test gains. */
+    SetPIDGains(testKp, testKi, testKd);
+
+    /*****************************************************************
+     * 3) WARM-UP PHASE (ignore error metrics during spool-up)
+     *****************************************************************/
+    const TickType_t warmUpTicks = pdMS_TO_TICKS(3000);  // 3-second warm-up
+    TickType_t startTicks = xTaskGetTickCount();
+    TickType_t warmUpEnd = startTicks + warmUpTicks;
+
+    const TickType_t stepDelay = pdMS_TO_TICKS(5);  // 10 ms loop
+    float dT = 0.005f; // 10 ms in float seconds
+
+    float pidIntegral   = 0.0f;
+    float previousError = 0.0f;
+    float pidOutput     = 0.0f;
+    float scaledDuty    = 0.0f;
+
+    while (xTaskGetTickCount() < warmUpEnd)
+    {
+        /* Basic mini-loop: read RPM, compute error, update PWM, but
+           do *not* accumulate scoring metrics. */
+
+        /* 3A) Read the current RPM (safely with a mutex). */
+        osMutexAcquire(dataMutexHandle, portMAX_DELAY);
+        uint16_t currRPM = tachReadValue;
+        osMutexRelease(dataMutexHandle);
+
+        /* 3B) Compute error (testSetpoint is global or externally set). */
+        float error = testSetpoint - currRPM;
+
+        /* 3C) Basic PID calculations. (Kp,Ki,Kd are set by SetPIDGains) */
+        pidIntegral  += (error * dT);
+        float pidDerivative = (error - previousError) / dT;
+        pidOutput    = (kP * error) + (kI * pidIntegral) + (kD * pidDerivative);
+
+        previousError = error;
+
+        /* 3D) Create scaled duty cycle and clamp. */
+        float pwmMaxValue = (float)__HAL_TIM_GET_AUTORELOAD(&htim1);
+        scaledDuty = (pidOutput / maxRPM) * pwmMaxValue;
+        if (scaledDuty < 0.0f)         scaledDuty = 0.0f;
+        if (scaledDuty > pwmMaxValue)  scaledDuty = pwmMaxValue;
+
+        /* 3E) Apply the scaled duty cycle to the fan. */
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)scaledDuty);
+
+        /* 3F) Wait a bit before the next iteration. */
+        vTaskDelay(stepDelay);
+    }
+
+    /*****************************************************************
+     * 4) MEASUREMENT PHASE (accumulate error metrics)
+     *****************************************************************/
+    /* 4A) Prepare performance-measurement variables. */
+    uint32_t onTargetCount = 0;
+    uint32_t offTargetCount = 0;
+    float absoluteErrorSum  = 0.0f;  // for IAE
+
+    /* "Close enough" threshold for on-target. */
+    float threshold = 300.0f; // ±300 RPM
+
+    /* 4B) Prepare for the measurement window. */
+    TickType_t measureTicks = (TickType_t)(testTime * 1000 / portTICK_PERIOD_MS);
+    TickType_t measureStart = xTaskGetTickCount();            // current time
+    TickType_t measureEnd   = measureStart + measureTicks;    // end of test
+
+    // We can optionally reset integral or keep it from warm-up:
+    // pidIntegral = 0.0f; // If you want to reset the integrator at measurement start
+
+    while (xTaskGetTickCount() < measureEnd)
+    {
+        /* 4C) Read the current RPM (safely with a mutex). */
+        osMutexAcquire(dataMutexHandle, portMAX_DELAY);
+        uint16_t currRPM = tachReadValue;
+        osMutexRelease(dataMutexHandle);
+
+        /* 4D) Compute error. */
+        float error = testSetpoint - currRPM;
+
+        /* 4E) Accumulate absolute error for IAE. */
+        absoluteErrorSum += fabsf(error) * dT;
+
+        /* 4F) Check on-target vs. off-target. */
+        if (fabsf(error) <= threshold)
+            onTargetCount++;
+        else
+            offTargetCount++;
+
+        /* 4G) Basic PID calculations. */
+        pidIntegral  += (error * dT);
+        float pidDerivative = (error - previousError) / dT;
+        pidOutput    = (kP * error) + (kI * pidIntegral) + (kD * pidDerivative);
+        previousError = error;
+
+        /* 4H) Create scaled duty cycle and clamp. */
+        float pwmMaxValue = (float)__HAL_TIM_GET_AUTORELOAD(&htim1);
+        scaledDuty = (pidOutput / maxRPM) * pwmMaxValue;
+        if (scaledDuty < 0.0f)         scaledDuty = 0.0f;
+        if (scaledDuty > pwmMaxValue)  scaledDuty = pwmMaxValue;
+
+        /* 4I) Apply the scaled duty cycle to the fan. */
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)scaledDuty);
+
+        /* 4J) Wait stepDelay. */
+        vTaskDelay(stepDelay);
+    }
+
+    /*****************************************************************
+     * 5) Convert the error metrics into a final "score".
+     *    Lower IAE => better. Higher fraction on-target => better.
+     *****************************************************************/
+    float totalSamples = (float)(onTargetCount + offTargetCount);
+    float fractionOnTarget = 0.0f;
+    if (totalSamples > 0.0f)
+    {
+        fractionOnTarget = (float)onTargetCount / totalSamples;
+    }
+
+    /* 5A) Example: "score" that goes up with fractionOnTarget,
+                    goes down with large integral error. */
+    float localScore = 0.0f;
+    // Avoid dividing by zero:
+    float penalty = 1.0f + absoluteErrorSum / 100000.0f;
+    // e.g. scale absoluteErrorSum to an order-of-magnitude penalty
+    localScore = fractionOnTarget / penalty;
+
+    /*****************************************************************
+     * 6) Optionally restore original gains
+     *****************************************************************/
+    SetPIDGains(originalKp, originalKi, originalKd);
+
+    /*****************************************************************
+     * Return final "score": higher is better in this formula.
+     *****************************************************************/
+    return localScore;
+}
 
 /* USER CODE END FunctionPrototypes */
 
@@ -190,22 +366,90 @@ void StartFanControlTask(void *argument)
 	const uint32_t pwmMaxValue = __HAL_TIM_GET_AUTORELOAD(&htim1); // Max value for the PWM duty cycle (timer auto-reload value)
 
 	// PID variables
-	float pidIntegral = 0.0f;
 	float previousError = 0.0f;
 	float kP = 62.0f;
-	float kI = 1.62f;
-	float kD = 0.162f;
-	float dT = 0.01f; // Assumes this tasks runs every 100ms
+	float kI = 0.0f;
+	float kD = 0.0f;
+	float dT = 0.01f; // Assumes this tasks runs every 10ms
 	float setPoint = 0.0f;
 	float error = 0.0f;
+	float pidIntegral = 0.0f;
 	float pidDerivative = 0.0f;
 	float pidOutput = 0.0f;
 	float scaledDuty = 0.0f;
 	uint16_t potValue = 0; // Get the latest potentiometer value (0-100%)
 	uint16_t currentRPM = 0;
 
+	// used for PID tuning
+	testSetpoint = 0.7f * maxRPM;
 
+	/***************************************************************/
+	/*   OPTIONAL AUTO-TUNING PROCEDURE: comment out if not used   */
+	/***************************************************************/
+	// Arrays of Kp, Ki, Kd to try:
+	// First Test
+    /*float possibleKp[] = {
+	0.0f, 5.0f, 10.0f, 15.0f, 20.0f, 25.0f, 30.0f, 35.0f, 40.0f, 45.0f,
+	50.0f, 55.0f, 60.0f, 65.0f, 70.0f, 75.0f, 80.0f, 85.0f, 90.0f, 95.0f,
+	100.0f, 105.0f, 110.0f, 115.0f, 120.0f, 125.0f, 130.0f, 135.0f, 140.0f, 145.0f,
+	150.0f, 155.0f, 160.0f, 165.0f, 170.0f, 175.0f, 180.0f, 185.0f, 190.0f, 195.0f,
+	200.0f, 205.0f, 210.0f, 215.0f, 220.0f, 225.0f, 230.0f, 235.0f, 240.0f, 245.0f,
+	250.0f, 255.0f, 260.0f, 265.0f, 270.0f, 275.0f, 280.0f, 285.0f, 290.0f, 295.0f,
+	300.0f, 305.0f, 310.0f, 315.0f, 320.0f, 325.0f, 330.0f, 335.0f, 340.0f, 345.0f,
+	350.0f, 355.0f, 360.0f, 365.0f, 370.0f, 375.0f, 380.0f, 385.0f, 390.0f, 395.0f,
+	400.0f
+	};*/
+	// Second test
+	/*float possibleKp[] = {
+			300.0f, 300.5f, 301.0f, 301.5f, 302.0f, 302.5f, 303.0f,
+			303.5f, 304.0f, 304.5f, 305.0f, 305.5f, 306.0f, 306.5f, 307.0f, 307.5f,
+			308.0f, 308.5f, 309.0f, 309.5f, 310.0f
+	};*/
+	float possibleKp[] = {304.5f};
 
+float possibleKi[] = {
+	    0.0f,
+	    0.00005f, 0.0001f, 0.0002f, 0.0004f, 0.0008f,
+	    0.0016f, 0.0032f, 0.0064f, 0.0128f,
+	    0.0256f, 0.0512f, 0.1024f, 0.2048f, 0.4096f, 0.8192f, 1.6384f, 3.2768f
+		};
+	float possibleKd[] = {0.0f};
+
+	float bestKp   = kP;
+	float bestKi   = kI;
+	float bestKd   = kD;
+
+	// *** Loop over possible gains:
+	for (size_t i=0; i< (sizeof(possibleKp)/sizeof(possibleKp[0])); i++)
+	{
+		for (size_t j=0; j< (sizeof(possibleKi)/sizeof(possibleKi[0])); j++)
+		{
+			for (size_t k=0; k< (sizeof(possibleKd)/sizeof(possibleKd[0])); k++)
+			{
+			  float kpVal = possibleKp[i];
+			  float kiVal = possibleKi[j];
+			  float kdVal = possibleKd[k];
+
+			  score = RunPIDTest(kpVal, kiVal, kdVal);
+			  // Compare:
+			  if (score > bestScore)
+			  {
+				  bestScore = score;
+				  bestKp    = kpVal;
+				  bestKi    = kiVal;
+				  bestKd    = kdVal;
+			  }
+
+			  // Optional short delay before next test
+			  //osDelay(pdMS_TO_TICKS(200));
+			}
+		}
+	}
+
+	// When tuning place a break point here to see best values
+	SetPIDGains(bestKp, bestKi, bestKd);
+
+	// *** (END of auto-tuning procedure) ***
 
 	for(;;)
 	{
@@ -224,8 +468,6 @@ void StartFanControlTask(void *argument)
 		// PID Calculation
 		pidIntegral += error * dT;
 		pidDerivative = (error - previousError) / dT;
-		//pidOutput = (kP * error);
-		//pidOutput = (kP * error) + (kI * pidIntegral);
 		pidOutput = (kP * error) + (kI * pidIntegral) + (kD * pidDerivative);
 
 		scaledDuty = (pidOutput / maxRPM) * (float)pwmMaxValue;
@@ -235,14 +477,19 @@ void StartFanControlTask(void *argument)
 		{
 			scaledDuty = 0;
 		}
-		if (scaledDuty > (float)pwmMaxValue) scaledDuty = (float)pwmMaxValue;
+		if (scaledDuty > (float)pwmMaxValue)
+		{
+			scaledDuty = (float)pwmMaxValue;
+		}
+
+
 
 		previousError = error;
 
 		//Set PWM based on PID Output
 		__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)scaledDuty);
 
-		osDelay(pdMS_TO_TICKS(10)); // Adjust as necessary
+		osDelay(pdMS_TO_TICKS(5)); // Adjust as necessary
 	}
   /* USER CODE END StartFanControlTask */
 }
@@ -366,7 +613,7 @@ void StartMonitorTachTask(void *argument)
 		}
 
 
-	osDelay(pdMS_TO_TICKS(100));
+	osDelay(pdMS_TO_TICKS(5));
 	}
   /* USER CODE END StartMonitorTachTask */
 }
@@ -388,6 +635,8 @@ void StartUpdateLCDTask(void *argument)
   uint16_t batteryLifeRemaining = 0;
   uint16_t targetFanRPM = 0;
 
+  lcd_clear(&lcd);
+
   for(;;)
   {
 	// Read shared variables
@@ -404,16 +653,28 @@ void StartUpdateLCDTask(void *argument)
 	currentBatteryVoltage = currentBatteryVoltage / 1000; //Convert mv to v for easy read
 	currentBatteryVoltage = (float)((int)(currentBatteryVoltage * 10)) / 10.0f; // trim to tenth place
 
+	/* Use for PID tuning */
+	uint16_t localBestScore = roundf(bestScore * 100);
+	uint16_t localScore = roundf(score * 100);
+	snprintf(line1, sizeof(line1), "%5u-S:%d/BS:%d", currentFanRPM, localScore, localBestScore);
+	lcd_setCursor(&lcd, 0, 0);
+	lcd_print(&lcd, line1);
+	snprintf(line2, sizeof(line2), "p%.0fi%.3fd%.3f", kP, kI, kD);
+	lcd_setCursor(&lcd, 0, 1);
+	lcd_print(&lcd, line2);
+	/* End PID Tuning output */
+
+	/* Normal Operation output */
 	// Update LCD with new data
-	snprintf(line1, sizeof(line1), "RPM: %5u/%5u", currentFanRPM, targetFanRPM);
+	/*snprintf(line1, sizeof(line1), "RPM: %5u/%5u", currentFanRPM, targetFanRPM);
 	lcd_setCursor(&lcd, 0, 0);
 	lcd_print(&lcd, line1);
 	snprintf(line2, sizeof(line2), "Power: %.1fv/%2u%%", currentBatteryVoltage, batteryLifeRemaining);
-
 	lcd_setCursor(&lcd, 0, 1);
 	lcd_print(&lcd, line2);
+	/* End Normal Operation output */
 
-	osDelay(100); // Adjust as needed
+	osDelay(25 ); // Adjust as needed
   }
   /* USER CODE END StartUpdateLCDTask */
 }

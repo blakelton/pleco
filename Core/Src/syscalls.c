@@ -30,6 +30,29 @@
 #include <sys/time.h>
 #include <sys/times.h>
 
+// Debug Exception & Monitor Control Register Base Address
+#define ITM_TRACE_EN          *((volatile uint32_t*) 0xE00000E00)
+
+// ITM Register Address
+#define DEMCR                 *((volatile uint32_t*) 0xE000EDFCU)
+#define ITM_STIMULUS_PORT0    *((volatile uint32_t*) 0xE00000000)
+
+/* Debug function for printf used in __write() */
+void ITM_SendChar(uint8_t ch)
+{
+	// Enable TRCENA
+	DEMCR |= (1<<24);
+
+	// Enable Stimulus Port0
+	ITM_TRACE_EN |= (1<<0);
+
+	// Read FIFO status in bit[0]:
+	while(!(ITM_STIMULUS_PORT0 & 1));
+
+	// Write to ITM Stimulus Port0
+	ITM_STIMULUS_PORT0 = ch;
+}
+
 
 /* Variables */
 extern int __io_putchar(int ch) __attribute__((weak));
@@ -85,6 +108,7 @@ __attribute__((weak)) int _write(int file, char *ptr, int len)
   for (DataIdx = 0; DataIdx < len; DataIdx++)
   {
     __io_putchar(*ptr++);
+    //ITM_SendChar(*ptr++); //for swv printf use
   }
   return len;
 }
