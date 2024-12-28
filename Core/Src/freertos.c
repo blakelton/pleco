@@ -142,146 +142,160 @@ void SetPIDGains(float kp, float ki, float kd)
   */
 float RunPIDTest(float testKp, float testKi, float testKd)
 {
-    /* 1) Save original gains so we can restore later. */
+    // 1) Save original gains so we can restore later
     float originalKp = kP;
     float originalKi = kI;
     float originalKd = kD;
 
-    /* 2) Apply the test gains. */
+    // 2) Apply the test gains
     SetPIDGains(testKp, testKi, testKd);
 
-    /*****************************************************************
+    /************************************************************
      * 3) WARM-UP PHASE (ignore error metrics during spool-up)
-     *****************************************************************/
-    const TickType_t warmUpTicks = pdMS_TO_TICKS(3000);  // 3-second warm-up
+     ************************************************************/
+    const TickType_t warmUpTicks = pdMS_TO_TICKS(3000); // e.g., 3 seconds
     TickType_t startTicks = xTaskGetTickCount();
-    TickType_t warmUpEnd = startTicks + warmUpTicks;
+    TickType_t warmUpEnd  = startTicks + warmUpTicks;
 
-    const TickType_t stepDelay = pdMS_TO_TICKS(5);  // 10 ms loop
-    float dT = 0.005f; // 10 ms in float seconds
+    const TickType_t stepDelay = pdMS_TO_TICKS(5); // 5 ms loop
+    float dT = 0.005f; // 5 ms in float seconds
 
-    float pidIntegral   = 0.0f;
-    float previousError = 0.0f;
-    float pidOutput     = 0.0f;
-    float scaledDuty    = 0.0f;
+    float pidIntegral    = 0.0f;
+    float previousError  = 0.0f;
+    float pidOutput      = 0.0f;
+    float scaledDuty     = 0.0f;
+
+    // Keep track of the previous duty cycle for "soft clamp"
+    float lastDuty       = 0.0f;
 
     while (xTaskGetTickCount() < warmUpEnd)
     {
-        /* Basic mini-loop: read RPM, compute error, update PWM, but
-           do *not* accumulate scoring metrics. */
-
-        /* 3A) Read the current RPM (safely with a mutex). */
+        // 3A) Read current RPM
         osMutexAcquire(dataMutexHandle, portMAX_DELAY);
         uint16_t currRPM = tachReadValue;
         osMutexRelease(dataMutexHandle);
 
-        /* 3B) Compute error (testSetpoint is global or externally set). */
+        // 3B) Compute error
         float error = testSetpoint - currRPM;
 
-        /* 3C) Basic PID calculations. (Kp,Ki,Kd are set by SetPIDGains) */
-        pidIntegral  += (error * dT);
+        // 3C) Basic PID
+        pidIntegral       += (error * dT);
         float pidDerivative = (error - previousError) / dT;
-        pidOutput    = (kP * error) + (kI * pidIntegral) + (kD * pidDerivative);
+        pidOutput          = (kP * error) + (kI * pidIntegral) + (kD * pidDerivative);
+        previousError      = error;
 
-        previousError = error;
-
-        /* 3D) Create scaled duty cycle and clamp. */
+        // 3D) Convert to duty cycle
         float pwmMaxValue = (float)__HAL_TIM_GET_AUTORELOAD(&htim1);
         scaledDuty = (pidOutput / maxRPM) * pwmMaxValue;
-        if (scaledDuty < 0.0f)         scaledDuty = 0.0f;
-        if (scaledDuty > pwmMaxValue)  scaledDuty = pwmMaxValue;
 
-        /* 3E) Apply the scaled duty cycle to the fan. */
+        // 3E) "Soft clamp" approach for negative outputs
+        if (scaledDuty < 0.0f)
+        {
+            // For example: reduce duty proportionally,
+            // but not all the way to zero:
+            float overshootMagnitude = -scaledDuty;  // how negative we went
+            // e.g., reduce from lastDuty by fraction
+            float reductionFraction   = 0.5f; // tweak as needed
+            scaledDuty = lastDuty - (overshootMagnitude * reductionFraction);
+
+            // If that still ends up below zero, clamp to zero
+            if (scaledDuty < 0.0f)
+                scaledDuty = 0.0f;
+        }
+
+        // 3F) Also clamp if above max
+        if (scaledDuty > pwmMaxValue)
+            scaledDuty = pwmMaxValue;
+
+        // 3G) Apply the scaled duty
         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)scaledDuty);
 
-        /* 3F) Wait a bit before the next iteration. */
+        // 3H) Save duty for next iteration
+        lastDuty = scaledDuty;
+
+        // 3I) Wait a bit
         vTaskDelay(stepDelay);
     }
 
-    /*****************************************************************
+    /************************************************************
      * 4) MEASUREMENT PHASE (accumulate error metrics)
-     *****************************************************************/
-    /* 4A) Prepare performance-measurement variables. */
-    uint32_t onTargetCount = 0;
-    uint32_t offTargetCount = 0;
-    float absoluteErrorSum  = 0.0f;  // for IAE
+     ************************************************************/
+    uint32_t onTargetCount    = 0;
+    uint32_t offTargetCount   = 0;
+    float absoluteErrorSum     = 0.0f;
 
-    /* "Close enough" threshold for on-target. */
-    float threshold = 300.0f; // ±300 RPM
+    float threshold           = 300.0f;  // ±300 RPM
+    TickType_t measureTicks   = (TickType_t)(testTime * 1000 / portTICK_PERIOD_MS);
+    TickType_t measureStart   = xTaskGetTickCount();
+    TickType_t measureEnd     = measureStart + measureTicks;
 
-    /* 4B) Prepare for the measurement window. */
-    TickType_t measureTicks = (TickType_t)(testTime * 1000 / portTICK_PERIOD_MS);
-    TickType_t measureStart = xTaskGetTickCount();            // current time
-    TickType_t measureEnd   = measureStart + measureTicks;    // end of test
-
-    // We can optionally reset integral or keep it from warm-up:
-    // pidIntegral = 0.0f; // If you want to reset the integrator at measurement start
+    // Optionally reset integrator at start of measurement
+    // pidIntegral = 0.0f;
 
     while (xTaskGetTickCount() < measureEnd)
     {
-        /* 4C) Read the current RPM (safely with a mutex). */
+        // 4A) Read current RPM
         osMutexAcquire(dataMutexHandle, portMAX_DELAY);
         uint16_t currRPM = tachReadValue;
         osMutexRelease(dataMutexHandle);
 
-        /* 4D) Compute error. */
+        // 4B) Compute error
         float error = testSetpoint - currRPM;
-
-        /* 4E) Accumulate absolute error for IAE. */
         absoluteErrorSum += fabsf(error) * dT;
 
-        /* 4F) Check on-target vs. off-target. */
+        // 4C) On-target or off-target
         if (fabsf(error) <= threshold)
             onTargetCount++;
         else
             offTargetCount++;
 
-        /* 4G) Basic PID calculations. */
-        pidIntegral  += (error * dT);
+        // 4D) PID calculations
+        pidIntegral       += (error * dT);
         float pidDerivative = (error - previousError) / dT;
-        pidOutput    = (kP * error) + (kI * pidIntegral) + (kD * pidDerivative);
-        previousError = error;
+        pidOutput          = (kP * error) + (kI * pidIntegral) + (kD * pidDerivative);
+        previousError      = error;
 
-        /* 4H) Create scaled duty cycle and clamp. */
+        // 4E) Convert to duty cycle
         float pwmMaxValue = (float)__HAL_TIM_GET_AUTORELOAD(&htim1);
-        scaledDuty = (pidOutput / maxRPM) * pwmMaxValue;
-        if (scaledDuty < 0.0f)         scaledDuty = 0.0f;
-        if (scaledDuty > pwmMaxValue)  scaledDuty = pwmMaxValue;
+        scaledDuty        = (pidOutput / maxRPM) * pwmMaxValue;
 
-        /* 4I) Apply the scaled duty cycle to the fan. */
+        // 4F) "Soft clamp" again
+        if (scaledDuty < 0.0f)
+        {
+            float overshootMagnitude = -scaledDuty;
+            float reductionFraction   = 0.5f;
+            scaledDuty = lastDuty - (overshootMagnitude * reductionFraction);
+            if (scaledDuty < 0.0f)
+                scaledDuty = 0.0f;
+        }
+
+        if (scaledDuty > pwmMaxValue)
+            scaledDuty = pwmMaxValue;
+
         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)scaledDuty);
 
-        /* 4J) Wait stepDelay. */
+        lastDuty = scaledDuty;
+
         vTaskDelay(stepDelay);
     }
 
-    /*****************************************************************
-     * 5) Convert the error metrics into a final "score".
-     *    Lower IAE => better. Higher fraction on-target => better.
-     *****************************************************************/
+    /************************************************************
+     * 5) Convert the error metrics into a final "score"
+     ************************************************************/
     float totalSamples = (float)(onTargetCount + offTargetCount);
     float fractionOnTarget = 0.0f;
     if (totalSamples > 0.0f)
-    {
         fractionOnTarget = (float)onTargetCount / totalSamples;
-    }
 
-    /* 5A) Example: "score" that goes up with fractionOnTarget,
-                    goes down with large integral error. */
     float localScore = 0.0f;
-    // Avoid dividing by zero:
-    float penalty = 1.0f + absoluteErrorSum / 100000.0f;
-    // e.g. scale absoluteErrorSum to an order-of-magnitude penalty
-    localScore = fractionOnTarget / penalty;
+    float penalty    = 1.0f + absoluteErrorSum / 100000.0f;
+    localScore       = fractionOnTarget / penalty;
 
-    /*****************************************************************
-     * 6) Optionally restore original gains
-     *****************************************************************/
+    /************************************************************
+     * 6) Restore original gains
+     ************************************************************/
     SetPIDGains(originalKp, originalKi, originalKd);
 
-    /*****************************************************************
-     * Return final "score": higher is better in this formula.
-     *****************************************************************/
     return localScore;
 }
 
