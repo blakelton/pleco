@@ -30,14 +30,13 @@
 #include <sys/time.h>
 #include <sys/times.h>
 
+/* Debug approach for printf - uncomment to and use in __write()
 // Debug Exception & Monitor Control Register Base Address
 #define ITM_TRACE_EN          *((volatile uint32_t*) 0xE00000E00)
 
 // ITM Register Address
 #define DEMCR                 *((volatile uint32_t*) 0xE000EDFCU)
 #define ITM_STIMULUS_PORT0    *((volatile uint32_t*) 0xE00000000)
-
-/* Debug function for printf used in __write() */
 void ITM_SendChar(uint8_t ch)
 {
 	// Enable TRCENA
@@ -52,6 +51,7 @@ void ITM_SendChar(uint8_t ch)
 	// Write to ITM Stimulus Port0
 	ITM_STIMULUS_PORT0 = ch;
 }
+*/
 
 
 /* Variables */

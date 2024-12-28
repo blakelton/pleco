@@ -66,15 +66,18 @@ volatile float captureDutyCycleLog[CAPTURE_LOG_SIZE];
 volatile unsigned int captureErrorLogIndex = 0;
 volatile uint8_t captureErrorLogOverflow = 0;        // Flag to indicate buffer overflow
 volatile float captureErrorLog[CAPTURE_LOG_SIZE];
+// Rate‐limiting parameter: how many timer counts we allow the duty cycle to change per iteration
+float maxDeltaPerLoop = 10000.0f; // adjust as needed
 
 // Max RPM - for DBTB0428B2G - manually measured using external tach;
 float maxRPM = 22000.0f;
 
 // used for PID Tuning
 float percentOnTarget = 0.0f;
-volatile float kP = 0.0f;
-volatile float kI = 0.0f;
-volatile float kD = 0.0f;
+// Best Scoring PID Values - Score: 38
+volatile float kP = 66.0f;
+volatile float kI = 7.3727f;
+volatile float kD = 0.00159f;
 float bestScore = -1.0f;
 float score = 0.0f;
 float testSetpoint = 0.7f; // 70% or 15400 RPM for PID tuning
@@ -158,7 +161,7 @@ float RunPIDTest(float testKp, float testKi, float testKd)
     SetPIDGains(testKp, testKi, testKd);
 
     /************************************************************
-     * 3) WARM-UP PHASE (ignore error metrics during spool-up)
+     * 3) WARM-UP PHASE
      ************************************************************/
     const TickType_t warmUpTicks = pdMS_TO_TICKS(2000); // e.g., 3 seconds
     TickType_t startTicks = xTaskGetTickCount();
@@ -174,10 +177,6 @@ float RunPIDTest(float testKp, float testKi, float testKd)
 
     // Keep track of the previous duty cycle for "soft clamp" & rate limit
     float lastDuty       = 0.0f;
-
-    // Rate‐limiting parameter: how many timer counts we allow
-    // the duty cycle to change per iteration
-    float maxDeltaPerLoop = 10000.0f; // adjust to taste
 
     while (xTaskGetTickCount() < warmUpEnd)
     {
@@ -427,9 +426,6 @@ void StartFanControlTask(void *argument)
 
 	// PID variables
 	float previousError = 0.0f;
-	float kP = 62.0f;
-	float kI = 0.0f;
-	float kD = 0.0f;
 	float dT = 0.01f; // Assumes this tasks runs every 10ms
 	float setPoint = 0.0f;
 	float error = 0.0f;
@@ -437,41 +433,30 @@ void StartFanControlTask(void *argument)
 	float pidDerivative = 0.0f;
 	float pidOutput = 0.0f;
 	float scaledDuty = 0.0f;
+	float lastDuty       = 0.0f; // Keeps track of the previous duty cycle for "soft clamp" & rate limit
 	uint16_t potValue = 0; // Get the latest potentiometer value (0-100%)
 	uint16_t currentRPM = 0;
 
-	// used for PID tuning
+
+	// used for PID tuning (15400)
 	testSetpoint = 0.7f * maxRPM;
 
-	/***************************************************************/
-	/*   OPTIONAL AUTO-TUNING PROCEDURE: comment out if not used   */
-	/***************************************************************/
+	/*
+	// OPTIONAL AUTO-TUNING PROCEDURE: comment out if not used
 	// Arrays of Kp, Ki, Kd to try:
-	// First Test
-	float possibleKp[] = {9.0f,9.5f,10.0f,10.5f,11.0f,11.5,12.0f,12.5f,13.0f,13.5f,14.0f};
-	// Second test
-	/*float possibleKp[] = {
-			300.0f, 300.5f, 301.0f, 301.5f, 302.0f, 302.5f, 303.0f,
-			303.5f, 304.0f, 304.5f, 305.0f, 305.5f, 306.0f, 306.5f, 307.0f, 307.5f,
-			308.0f, 308.5f, 309.0f, 309.5f, 310.0f
-	};*/
-	//float possibleKp[] = {304.5f};
+	// Kp to try
+	float possibleKp[] = {10.0f,15.0f,66.0f,304.5f};
+	// Ki to try
 	//float possibleKi[] = {0.0f};6.5536f,
-	float possibleKi[] = {
-			 0.4096f,
-			    0.8192f, 1.6384f, 3.2768f, 6.5536f,6.5536f, 7.3728f, 8.1920f, 9.0112f, 9.8304f,
-			    10.6496f, 11.4688f, 12.2880f, 13.1072f
-			};
+	float possibleKi[] = {0.4096f, 0.8192f};
 	//float possibleKd[] = {0.0f};
-	float possibleKd[] = {0.0008f, 0.0016f,
-	    0.0032f, 0.0064f, 0.0128f, 0.0256f
-	};
+	float possibleKd[] = {0.0008f, 0.0016f, 0.0032f, 0.0064f, 0.0128f, 0.0256f};
 
 	float bestKp   = kP;
 	float bestKi   = kI;
 	float bestKd   = kD;
 
-	// *** Loop over possible gains:
+	// Loop over possible gains:
 	for (size_t i=0; i< (sizeof(possibleKp)/sizeof(possibleKp[0])); i++)
 	{
 		for (size_t j=0; j< (sizeof(possibleKi)/sizeof(possibleKi[0])); j++)
@@ -491,57 +476,70 @@ void StartFanControlTask(void *argument)
 				  bestKi    = kiVal;
 				  bestKd    = kdVal;
 			  }
-
-			  // Optional short delay before next test
-			  //osDelay(pdMS_TO_TICKS(200));
 			}
 		}
 	}
 
 	// When tuning place a break point here to see best values
 	SetPIDGains(bestKp, bestKi, bestKd);
+	// *** (END of auto-tuning procedure) ****/
 
-	// *** (END of auto-tuning procedure) ***
-
-	for(;;)
+	for(;;)  // Main fan control loop
 	{
-		// Acquire the mutex to safely access potReadValue
+		// Acquire the mutex to safely access potReadValue, tachReadValue
 		osMutexAcquire(dataMutexHandle, osWaitForever);
-		potValue = potReadValue; // Get the latest potentiometer value (0-100%)
-		currentRPM = tachReadValue;
+		potValue   = potReadValue;   // e.g. 0–100
+		currentRPM = tachReadValue;  // measured from tach
 		osMutexRelease(dataMutexHandle);
 
-		// Convert the potValue to a target RPM
+		// Convert potValue% to a target RPM in [0, maxRPM]
 		setPoint = (potValue / 100.0f) * maxRPM;
 
 		// Calculate PID Error
 		error = setPoint - currentRPM;
 
-		// PID Calculation
-		pidIntegral += error * dT;
-		pidDerivative = (error - previousError) / dT;
-		pidOutput = (kP * error) + (kI * pidIntegral) + (kD * pidDerivative);
+		// PID Calculations
+		pidIntegral   += error * dT;
+		pidDerivative  = (error - previousError) / dT;
+		pidOutput      = (kP * error) + (kI * pidIntegral) + (kD * pidDerivative);
 
+		previousError  = error; // store for next iteration
+
+		// Convert pidOutput to duty cycle
 		scaledDuty = (pidOutput / maxRPM) * (float)pwmMaxValue;
 
-		// Clamp to [0, pwmMaxValue]
-		if (scaledDuty < 0)
+		// ============= 1) “Soft clamp” approach for negative outputs =============
+		if (scaledDuty < 0.0f)
 		{
-			scaledDuty = 0;
+		  float overshootMagnitude = -scaledDuty;   // how negative
+		  float reductionFraction   = 0.80f;         // tweak as needed
+		  scaledDuty = lastDuty - (overshootMagnitude * reductionFraction);
+
+		  if (scaledDuty < 0.0f)
+			scaledDuty = 0.0f;
 		}
-		if (scaledDuty > (float)pwmMaxValue)
-		{
-			scaledDuty = (float)pwmMaxValue;
-		}
 
+		// ============= 2) Hard clamp if above max =============
+		if (scaledDuty > pwmMaxValue) scaledDuty = pwmMaxValue;
 
+		// ============= 3) Rate‐limiting code =============
+		float delta = scaledDuty - lastDuty;
+		if (delta >  maxDeltaPerLoop)   delta =  maxDeltaPerLoop;
+		if (delta < -maxDeltaPerLoop)   delta = -maxDeltaPerLoop;
+		scaledDuty = lastDuty + delta;
 
-		previousError = error;
+		// Final clamp again if it ended up outside [0, pwmMaxValue]
+		if (scaledDuty < 0.0f) scaledDuty = 0.0f;
+		if (scaledDuty > pwmMaxValue) scaledDuty = pwmMaxValue;
 
-		//Set PWM based on PID Output
+		// 4) Apply the final scaled duty
 		__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)scaledDuty);
 
-		osDelay(pdMS_TO_TICKS(10)); // Adjust as necessary
+		// 5) Save for next loop iteration
+		lastDuty = scaledDuty;
+
+		// Delay ~10 ms
+		osDelay(pdMS_TO_TICKS(10));
 	}
   /* USER CODE END StartFanControlTask */
 }
@@ -705,7 +703,7 @@ void StartUpdateLCDTask(void *argument)
 	currentBatteryVoltage = currentBatteryVoltage / 1000; //Convert mv to v for easy read
 	currentBatteryVoltage = (float)((int)(currentBatteryVoltage * 10)) / 10.0f; // trim to tenth place
 
-	/* Use for PID tuning */
+	/* Use for PID tuning - comment out when not tuning
 	uint16_t localBestScore = roundf(bestScore * 100);
 	uint16_t localScore = roundf(score * 100);
 	snprintf(line1, sizeof(line1), "%5u-S:%d/BS:%d", currentFanRPM, localScore, localBestScore);
@@ -714,11 +712,11 @@ void StartUpdateLCDTask(void *argument)
 	snprintf(line2, sizeof(line2), "p%.0fi%.3fd%.3f", kP, kI, kD);
 	lcd_setCursor(&lcd, 0, 1);
 	lcd_print(&lcd, line2);
-	/* End PID Tuning output */
+	// End PID Tuning output */
 
 	/* Normal Operation output */
 	// Update LCD with new data
-	/*snprintf(line1, sizeof(line1), "RPM: %5u/%5u", currentFanRPM, targetFanRPM);
+	snprintf(line1, sizeof(line1), "RPM: %5u/%5u", currentFanRPM, targetFanRPM);
 	lcd_setCursor(&lcd, 0, 0);
 	lcd_print(&lcd, line1);
 	snprintf(line2, sizeof(line2), "Power: %.1fv/%2u%%", currentBatteryVoltage, batteryLifeRemaining);
