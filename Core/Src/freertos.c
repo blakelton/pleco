@@ -59,6 +59,13 @@ uint16_t batteryReadValue;
 uint16_t tachReadValue;
 extern LiquidCrystal_I2C lcd;
 uint32_t localFanPeriod = 0;
+#define CAPTURE_LOG_SIZE 1000
+volatile unsigned int captureDutyCycleLogIndex = 0;
+volatile uint8_t captureDutyCycleLogOverflow = 0;        // Flag to indicate buffer overflow
+volatile float captureDutyCycleLog[CAPTURE_LOG_SIZE];
+volatile unsigned int captureErrorLogIndex = 0;
+volatile uint8_t captureErrorLogOverflow = 0;        // Flag to indicate buffer overflow
+volatile float captureErrorLog[CAPTURE_LOG_SIZE];
 
 // Max RPM - for DBTB0428B2G - manually measured using external tach;
 float maxRPM = 22000.0f;
@@ -71,7 +78,7 @@ volatile float kD = 0.0f;
 float bestScore = -1.0f;
 float score = 0.0f;
 float testSetpoint = 0.7f; // 70% or 15400 RPM for PID tuning
-float testTime = 5.0f; // 15 seconds each test
+float testTime = 20.0f; // 15 seconds each test
 
 
 /* USER CODE END Variables */
@@ -153,20 +160,24 @@ float RunPIDTest(float testKp, float testKi, float testKd)
     /************************************************************
      * 3) WARM-UP PHASE (ignore error metrics during spool-up)
      ************************************************************/
-    const TickType_t warmUpTicks = pdMS_TO_TICKS(3000); // e.g., 3 seconds
+    const TickType_t warmUpTicks = pdMS_TO_TICKS(2000); // e.g., 3 seconds
     TickType_t startTicks = xTaskGetTickCount();
     TickType_t warmUpEnd  = startTicks + warmUpTicks;
 
-    const TickType_t stepDelay = pdMS_TO_TICKS(5); // 5 ms loop
-    float dT = 0.005f; // 5 ms in float seconds
+    const TickType_t stepDelay = pdMS_TO_TICKS(10); // 10 ms loop
+    float dT = 0.01f; // 10 ms in float seconds
 
     float pidIntegral    = 0.0f;
     float previousError  = 0.0f;
     float pidOutput      = 0.0f;
     float scaledDuty     = 0.0f;
 
-    // Keep track of the previous duty cycle for "soft clamp"
+    // Keep track of the previous duty cycle for "soft clamp" & rate limit
     float lastDuty       = 0.0f;
+
+    // Rate‐limiting parameter: how many timer counts we allow
+    // the duty cycle to change per iteration
+    float maxDeltaPerLoop = 10000.0f; // adjust to taste
 
     while (xTaskGetTickCount() < warmUpEnd)
     {
@@ -191,14 +202,10 @@ float RunPIDTest(float testKp, float testKi, float testKd)
         // 3E) "Soft clamp" approach for negative outputs
         if (scaledDuty < 0.0f)
         {
-            // For example: reduce duty proportionally,
-            // but not all the way to zero:
-            float overshootMagnitude = -scaledDuty;  // how negative we went
-            // e.g., reduce from lastDuty by fraction
-            float reductionFraction   = 0.5f; // tweak as needed
+            float overshootMagnitude  = -scaledDuty;  // how negative we went
+            float reductionFraction   = 0.80f;         // tweak as needed
             scaledDuty = lastDuty - (overshootMagnitude * reductionFraction);
 
-            // If that still ends up below zero, clamp to zero
             if (scaledDuty < 0.0f)
                 scaledDuty = 0.0f;
         }
@@ -206,6 +213,16 @@ float RunPIDTest(float testKp, float testKi, float testKd)
         // 3F) Also clamp if above max
         if (scaledDuty > pwmMaxValue)
             scaledDuty = pwmMaxValue;
+
+        // >>>> NEW RATE‐LIMITING BLOCK <<<<
+        float delta = scaledDuty - lastDuty;
+        if (delta >  maxDeltaPerLoop)  delta =  maxDeltaPerLoop;
+        if (delta < -maxDeltaPerLoop)  delta = -maxDeltaPerLoop;
+        scaledDuty = lastDuty + delta;
+        // (Now clamp again if it drifted below 0 or above max)
+        if (scaledDuty < 0.0f)         scaledDuty = 0.0f;
+        if (scaledDuty > pwmMaxValue)  scaledDuty = pwmMaxValue;
+        // <<<< END RATE‐LIMITING BLOCK >>>>
 
         // 3G) Apply the scaled duty
         __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)scaledDuty);
@@ -255,16 +272,26 @@ float RunPIDTest(float testKp, float testKi, float testKd)
         pidOutput          = (kP * error) + (kI * pidIntegral) + (kD * pidDerivative);
         previousError      = error;
 
+        // Log the current capture value for analyzing tach data
+        captureErrorLog[captureDutyCycleLogIndex] = error;  // Write to the buffer
+        captureErrorLogIndex++;
+        if (captureErrorLogIndex >= CAPTURE_LOG_SIZE)
+        {
+            captureErrorLogIndex = 0;
+            captureErrorLogOverflow = 1; // Indicate overflow
+        }
+
         // 4E) Convert to duty cycle
         float pwmMaxValue = (float)__HAL_TIM_GET_AUTORELOAD(&htim1);
         scaledDuty        = (pidOutput / maxRPM) * pwmMaxValue;
 
-        // 4F) "Soft clamp" again
+        // 4F) "Soft clamp" again for negative
         if (scaledDuty < 0.0f)
         {
-            float overshootMagnitude = -scaledDuty;
+            float overshootMagnitude  = -scaledDuty;
             float reductionFraction   = 0.5f;
             scaledDuty = lastDuty - (overshootMagnitude * reductionFraction);
+
             if (scaledDuty < 0.0f)
                 scaledDuty = 0.0f;
         }
@@ -272,8 +299,27 @@ float RunPIDTest(float testKp, float testKi, float testKd)
         if (scaledDuty > pwmMaxValue)
             scaledDuty = pwmMaxValue;
 
-        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)scaledDuty);
+        // >>>> RATE‐LIMITING AGAIN <<<<
+        float delta = scaledDuty - lastDuty;
+        if (delta >  maxDeltaPerLoop)  delta =  maxDeltaPerLoop;
+        if (delta < -maxDeltaPerLoop)  delta = -maxDeltaPerLoop;
+        scaledDuty = lastDuty + delta;
+        // final clamp
+        if (scaledDuty < 0.0f)         scaledDuty = 0.0f;
+        if (scaledDuty > pwmMaxValue)  scaledDuty = pwmMaxValue;
+        // <<<< END RATE‐LIMITING BLOCK >>>>
 
+		 // Log the current capture value for analyzing tach data
+       captureDutyCycleLog[captureDutyCycleLogIndex] = scaledDuty;  // Write to the buffer
+       captureDutyCycleLogIndex++;                            // Increment the index
+
+		if (captureDutyCycleLogIndex >= CAPTURE_LOG_SIZE)      // Handle buffer overflow
+		{
+			captureDutyCycleLogIndex = 0;                      // Reset index (circular buffer)
+			captureDutyCycleLogOverflow = 1;                   // Indicate overflow
+		}
+
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)scaledDuty);
         lastDuty = scaledDuty;
 
         vTaskDelay(stepDelay);
@@ -287,9 +333,8 @@ float RunPIDTest(float testKp, float testKi, float testKd)
     if (totalSamples > 0.0f)
         fractionOnTarget = (float)onTargetCount / totalSamples;
 
-    float localScore = 0.0f;
-    float penalty    = 1.0f + absoluteErrorSum / 100000.0f;
-    localScore       = fractionOnTarget / penalty;
+    float penalty = 1.0f + absoluteErrorSum / 100000.0f;
+    float localScore = fractionOnTarget / penalty;
 
     /************************************************************
      * 6) Restore original gains
@@ -298,6 +343,7 @@ float RunPIDTest(float testKp, float testKi, float testKd)
 
     return localScore;
 }
+
 
 /* USER CODE END FunctionPrototypes */
 
@@ -402,32 +448,24 @@ void StartFanControlTask(void *argument)
 	/***************************************************************/
 	// Arrays of Kp, Ki, Kd to try:
 	// First Test
-    /*float possibleKp[] = {
-	0.0f, 5.0f, 10.0f, 15.0f, 20.0f, 25.0f, 30.0f, 35.0f, 40.0f, 45.0f,
-	50.0f, 55.0f, 60.0f, 65.0f, 70.0f, 75.0f, 80.0f, 85.0f, 90.0f, 95.0f,
-	100.0f, 105.0f, 110.0f, 115.0f, 120.0f, 125.0f, 130.0f, 135.0f, 140.0f, 145.0f,
-	150.0f, 155.0f, 160.0f, 165.0f, 170.0f, 175.0f, 180.0f, 185.0f, 190.0f, 195.0f,
-	200.0f, 205.0f, 210.0f, 215.0f, 220.0f, 225.0f, 230.0f, 235.0f, 240.0f, 245.0f,
-	250.0f, 255.0f, 260.0f, 265.0f, 270.0f, 275.0f, 280.0f, 285.0f, 290.0f, 295.0f,
-	300.0f, 305.0f, 310.0f, 315.0f, 320.0f, 325.0f, 330.0f, 335.0f, 340.0f, 345.0f,
-	350.0f, 355.0f, 360.0f, 365.0f, 370.0f, 375.0f, 380.0f, 385.0f, 390.0f, 395.0f,
-	400.0f
-	};*/
+	float possibleKp[] = {9.0f,9.5f,10.0f,10.5f,11.0f,11.5,12.0f,12.5f,13.0f,13.5f,14.0f};
 	// Second test
 	/*float possibleKp[] = {
 			300.0f, 300.5f, 301.0f, 301.5f, 302.0f, 302.5f, 303.0f,
 			303.5f, 304.0f, 304.5f, 305.0f, 305.5f, 306.0f, 306.5f, 307.0f, 307.5f,
 			308.0f, 308.5f, 309.0f, 309.5f, 310.0f
 	};*/
-	float possibleKp[] = {304.5f};
-
-float possibleKi[] = {
-	    0.0f,
-	    0.00005f, 0.0001f, 0.0002f, 0.0004f, 0.0008f,
-	    0.0016f, 0.0032f, 0.0064f, 0.0128f,
-	    0.0256f, 0.0512f, 0.1024f, 0.2048f, 0.4096f, 0.8192f, 1.6384f, 3.2768f
-		};
-	float possibleKd[] = {0.0f};
+	//float possibleKp[] = {304.5f};
+	//float possibleKi[] = {0.0f};6.5536f,
+	float possibleKi[] = {
+			 0.4096f,
+			    0.8192f, 1.6384f, 3.2768f, 6.5536f,6.5536f, 7.3728f, 8.1920f, 9.0112f, 9.8304f,
+			    10.6496f, 11.4688f, 12.2880f, 13.1072f
+			};
+	//float possibleKd[] = {0.0f};
+	float possibleKd[] = {0.0008f, 0.0016f,
+	    0.0032f, 0.0064f, 0.0128f, 0.0256f
+	};
 
 	float bestKp   = kP;
 	float bestKi   = kI;
@@ -503,7 +541,7 @@ float possibleKi[] = {
 		//Set PWM based on PID Output
 		__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, (uint32_t)scaledDuty);
 
-		osDelay(pdMS_TO_TICKS(5)); // Adjust as necessary
+		osDelay(pdMS_TO_TICKS(10)); // Adjust as necessary
 	}
   /* USER CODE END StartFanControlTask */
 }
