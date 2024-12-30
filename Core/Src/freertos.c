@@ -53,13 +53,18 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-uint16_t adcBuffer[2]; // [0] used for pot, [1] for battery
-uint16_t potReadValue;
-uint16_t batteryReadValue;
-uint16_t tachReadValue;
-extern LiquidCrystal_I2C lcd;
-uint32_t localFanPeriod = 0;
 #define CAPTURE_LOG_SIZE 1000
+#define CAPTURE_BATTERY_LOG_SIZE 50 // Size of array for moving average
+#define POT_HYSTERESIS_THRESHOLD 50 // 50 mv
+#define POT_LOW_PASS_ALPHA 1.0f	//Responsiveness at max (range 0.0 - 1.0 higher is faster)
+extern LiquidCrystal_I2C lcd;
+volatile uint16_t adcBuffer[2]; // [0] used for pot, [1] for battery
+volatile uint16_t potReadValue;
+volatile uint16_t batteryReadValue;
+volatile uint16_t tachReadValue;
+volatile uint32_t localFanPeriod = 0;
+volatile unsigned int captureBatteryLogIndex = 0;
+volatile float captureBatteryLog[CAPTURE_BATTERY_LOG_SIZE];
 volatile unsigned int captureDutyCycleLogIndex = 0;
 volatile uint8_t captureDutyCycleLogOverflow = 0;        // Flag to indicate buffer overflow
 volatile float captureDutyCycleLog[CAPTURE_LOG_SIZE];
@@ -67,21 +72,19 @@ volatile unsigned int captureErrorLogIndex = 0;
 volatile uint8_t captureErrorLogOverflow = 0;        // Flag to indicate buffer overflow
 volatile float captureErrorLog[CAPTURE_LOG_SIZE];
 // Rate‐limiting parameter: how many timer counts we allow the duty cycle to change per iteration
-float maxDeltaPerLoop = 10000.0f; // adjust as needed
-
+volatile float maxDeltaPerLoop = 10000.0f; // adjust as needed
 // Max RPM - for DBTB0428B2G - manually measured using external tach;
-float maxRPM = 22000.0f;
-
+volatile float maxRPM = 23000.0f;
 // used for PID Tuning
 float percentOnTarget = 0.0f;
 // Best Scoring PID Values - Score: 38
 volatile float kP = 66.0f;
 volatile float kI = 7.3727f;
 volatile float kD = 0.00159f;
-float bestScore = -1.0f;
-float score = 0.0f;
-float testSetpoint = 0.7f; // 70% or 15400 RPM for PID tuning
-float testTime = 20.0f; // 15 seconds each test
+volatile float bestScore = -1.0f;
+volatile float score = 0.0f;
+volatile float testSetpoint = 0.7f; // 70% or 15400 RPM for PID tuning
+volatile float testTime = 20.0f; // 15 seconds each test
 
 
 /* USER CODE END Variables */
@@ -132,6 +135,56 @@ const osSemaphoreAttr_t tachMonSem_attributes = {
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 
+/**
+  * @brief  This function uses a hybrid approach of Hysteresis and Low-Pass Filtering
+  * 		to ensure that the potentiometer reading is smooth but also responsive.
+  *
+  * @param  newReading : takes in the new potentiometer mv reading
+  */
+float processPotentiometerReading(float newReading)
+{
+	static float potLastAcceptedValue = 0.0f;
+	static float potFilteredValue = 0.0f;
+	// Apply Hysteresis to ignore small changes
+	if(fabs(newReading - potLastAcceptedValue) > POT_HYSTERESIS_THRESHOLD)
+	{
+		potLastAcceptedValue = newReading;
+	}
+
+	// Apply Low-pass filter for smoothing
+	potFilteredValue = potFilteredValue + POT_LOW_PASS_ALPHA * (potLastAcceptedValue - potFilteredValue);
+
+	return potFilteredValue;
+
+}
+
+
+/**
+  * @brief  Using a moving average to ignore any rapid fluctuations in the
+  * 		battery monitoring. Returns a floating value of the voltage level.
+  *
+  * @param  newReading : takes in the battery mv reading
+  */
+float processBatteryReading(float newReading)
+{
+	static int count = 0;
+	captureBatteryLog[captureBatteryLogIndex] = newReading;
+	captureBatteryLogIndex = (captureBatteryLogIndex +1 ) % CAPTURE_BATTERY_LOG_SIZE;
+	count = count < CAPTURE_BATTERY_LOG_SIZE ? count + 1 : CAPTURE_BATTERY_LOG_SIZE; // Increment up to buffer size
+
+	float sum = 0.0f;
+	for(int i = 0; i < count; i++)
+	{
+		sum += captureBatteryLog[i];
+	}
+	return sum / count;
+}
+
+/**
+  * @brief  Updates the globally used kP, kI and kD values.
+  *
+  * @param  kp, ki, kd : Gains to apply temporarily
+  */
 void SetPIDGains(float kp, float ki, float kd)
 {
     kP = kp;
@@ -146,9 +199,6 @@ void SetPIDGains(float kp, float ki, float kd)
   *         (e.g., fraction of time on target).
   *
   * @param  testKp, testKi, testKd : Gains to apply temporarily
-  * @param  testTimeSeconds        : How long (in seconds) to run the test
-  * @param  setPointRPM            : Desired target RPM for the test
-  * @return float                  : The measured performance score
   */
 float RunPIDTest(float testKp, float testKi, float testKd)
 {
@@ -569,11 +619,13 @@ void StartMonitorADCTask(void *argument)
 			  // Conversion is complete, buffer data is ready
 			  //potVoltage_mv = ((float)adcBuffer[0] / 4095.0f) * 3600.0f;
 			  potVoltage_mv = ((float)adcBuffer[0] / 4095.0f) * 3300.0f; // Read potentiometer voltage
+			  potVoltage_mv = processPotentiometerReading(potVoltage_mv);
 			  potPercentage = round((potVoltage_mv / 3200) * 100);
 			  if(potPercentage > 100){potPercentage = 100;}
 			  if(potPercentage < 0){potPercentage = 0;}
 
 			  batteryVoltage_mv = ((float)adcBuffer[1] / 4095.0f) * 3300.0f * BATTERY_SCALING_FACTOR;
+			  batteryVoltage_mv = processBatteryReading(batteryVoltage_mv);
 			  if(osMutexAcquire(dataMutexHandle, osWaitForever) == osOK)
 			  {
 				  // Variables are ready for updates
@@ -699,6 +751,7 @@ void StartUpdateLCDTask(void *argument)
 	osMutexRelease(dataMutexHandle);
 
 	// Calculate battery life - based on 12v 3s lipo battery
+	// use moving average to smooth out irregular readings
 	batteryLifeRemaining = round(((currentBatteryVoltage - 9000) / 3600) * 100);
 	currentBatteryVoltage = currentBatteryVoltage / 1000; //Convert mv to v for easy read
 	currentBatteryVoltage = (float)((int)(currentBatteryVoltage * 10)) / 10.0f; // trim to tenth place
@@ -724,7 +777,7 @@ void StartUpdateLCDTask(void *argument)
 	lcd_print(&lcd, line2);
 	/* End Normal Operation output */
 
-	osDelay(25 ); // Adjust as needed
+	osDelay(25); // Adjust as needed
   }
   /* USER CODE END StartUpdateLCDTask */
 }
