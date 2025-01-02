@@ -61,6 +61,7 @@
 #define BATTERY_LOW_THRESHOLD 10.5
 #define MAX_BATTERY_VOLTAGE 12.6 // 100%
 #define MAX_ADC_READ 3090 // 100% ADC READ (for battery logging initialization)
+#define ADC_NOISE_AVERAGE 52 // Measured average of noise when RPMS are High vs Low - adjust as needed
 
 extern LiquidCrystal_I2C lcd;
 
@@ -719,7 +720,6 @@ void StartFanControlTask(void *argument)
 	// Kp to try
 	float possibleKp[] = {10.0f,15.0f,66.0f,304.5f};
 	// Ki to try
-	//float possibleKi[] = {0.0f};6.5536f,
 	float possibleKi[] = {0.4096f, 0.8192f};
 	//float possibleKd[] = {0.0f};
 	float possibleKd[] = {0.0008f, 0.0016f, 0.0032f, 0.0064f, 0.0128f, 0.0256f};
@@ -873,9 +873,14 @@ void StartMonitorADCTask(void *argument)
 	  // Process Potentiometer Reading
 	  potVoltage_mv = ProcessPotentiometerReading(potVoltage_mv);
 	  // Derive potentiometer turn percentage
-	  localPotPercentage = round((potVoltage_mv / 3300) * 100);
+	  localPotPercentage = round((potVoltage_mv / 3200) * 100);
 	  if(localPotPercentage > 100){localPotPercentage = 100;}
 	  if(localPotPercentage < 0){localPotPercentage = 0;}
+
+	  // Apply offset for observed noise in the system
+	  float calculatedNoiseOffset =  ADC_NOISE_AVERAGE * (1.0f - ((float)localPotPercentage / 100));
+	  batteryVoltageReading += calculatedNoiseOffset;
+
 	  // Store Pot Values
 	  if(osMutexAcquire(dataMutexHandle, osWaitForever) == osOK)
 	  {

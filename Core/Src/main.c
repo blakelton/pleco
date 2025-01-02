@@ -28,7 +28,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+void InitializeBatteryMonitoringLog(void);
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
