@@ -89,7 +89,7 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
+  InitializeBatteryMonitoringLog();
 
   /* USER CODE END SysInit */
 
