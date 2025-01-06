@@ -913,7 +913,7 @@ void StartMonitorTachTask(void *argument)
 	const float timerFreq = 1000000.0f;
 	float localFrequency = 0.0f;
 	const float pulsesPerRev = 2.0f;
-	static float tachLastAcceptedValue = 0.0f;
+	static float tachLastAcceptedValue = 15000.0f; // initialize to mid-range
 	uint16_t rpm = 0;
 	/* Infinite loop */
 	for(;;)
