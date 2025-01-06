@@ -57,6 +57,7 @@
 #define CAPTURE_LOG_SIZE 1000
 #define CAPTURE_BATTERY_LOG_SIZE 50 // Size of array for moving average
 #define POT_HYSTERESIS_THRESHOLD 50 // 50 mv
+#define TACH_HYSTERESIS_THRESHOLD 10000 // 10000 RPM Limit
 #define POT_LOW_PASS_ALPHA 1.0f	//Responsiveness at max (range 0.0 - 1.0 higher is faster)
 #define BATTERY_LOW_THRESHOLD 10.5
 #define MAX_BATTERY_VOLTAGE 12.6 // 100%
@@ -912,6 +913,7 @@ void StartMonitorTachTask(void *argument)
 	const float timerFreq = 1000000.0f;
 	float localFrequency = 0.0f;
 	const float pulsesPerRev = 2.0f;
+	static float tachLastAcceptedValue = 0.0f;
 	uint16_t rpm = 0;
 	/* Infinite loop */
 	for(;;)
@@ -945,6 +947,17 @@ void StartMonitorTachTask(void *argument)
 					// Calculate RPM
 					localFrequency = timerFreq / (float)localFanPeriod;
 					rpm = (uint16_t)(localFrequency * ((float)60 / pulsesPerRev));
+					// Apply Hysteresis to ignore large changes
+					if(fabs(rpm - tachLastAcceptedValue) < TACH_HYSTERESIS_THRESHOLD)
+					{
+						// If change is within the acceptable range, accept the new RPM
+						tachLastAcceptedValue = rpm;
+					}
+					else
+					{
+						// Otherwise, retain the last accepted RPM value
+						rpm = tachLastAcceptedValue;
+					}
 				}
 				else
 				{
